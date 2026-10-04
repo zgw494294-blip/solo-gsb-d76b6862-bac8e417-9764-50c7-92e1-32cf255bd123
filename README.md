@@ -1399,15 +1399,98 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/
   -H 'Content-Type: application/json' -d '{"hidden_speakers": ["Alice"]}'           # 404
 ```
 
+## 定位（seek）：前跳/倒带到指定时刻并同步切换显示字幕
+
+`/advance` 与 `/events` 的游标只能不减；需要跳到稍后的位置（跳过片头）或倒带回前面的时刻时，使用定位接口：
+
+- `POST /sessions/{session_id}/seek`，请求体 `{"time_ms": N}`：`time_ms` 为**非负严格整数**（布尔值、数字字符串、小数一律 **422**，不做隐式转换）。与推进不同，定位允许小于当前游标（倒带），也允许等于当前游标；未知或已结束会话返回 **404**。
+- **跳过区间不补发事件**：定位不回放两个时刻之间的 enter/exit（前跳跨过的短字幕、倒带途经的字幕都不补发），只按**当前会话快照与隐藏集合**比对旧游标、目标时刻两个可见活动快照：
+  - 先为旧游标下的可见 active **逐条发 `exit`**；
+  - 再为目标时刻的 active **逐条发 `enter`**；
+  - **两边都活动的字幕也退出再进入**（成对给出）；定位到当前游标时同样成对重放。
+  - 事件沿用 `/events` 的字段（`id`/`speaker`/`track`/`time_ms`/`type`），`time_ms` **一律标记为目标时刻**（而非字幕真实的 start/end）；先 `exit` 后 `enter`，同类按会话字幕顺序。
+- 响应返回**游标、源版本、目标时刻可见 `active`、显示切换 `events` 与自动播放状态 `status`**。定位不改快照、隐藏集合或接纳规则；**原推进仍禁止倒退**（422），旧接口响应不变。
+- **补取通道**：已开启通道时，定位的显示切换事件与游标更新在同一会话锁内入队——已排队的未确认事件与 `acked_seq`/`max_returned_seq` 确认边界原样保留，新事件**接着 `next_seq` 连续编号**，时间回退仍按 `seq` 补取（通道不按时间去重）。容量不足返回 **503**：游标、队列、`seq`、自动播放计时段与播放状态全部不变，释放容量后可用原请求重试；未开通道不占容量，无事件的定位在满额时仍可执行。
+- **自动播放**：定位成功后，除**从未启动（idle）**的会话保持 idle 外，运行/暂停/阻塞中的会话一律转为**暂停（paused）**——运行中定位即暂停，返回后在途后台拍进锁即见非 running，旧驱动段不得再推进；需要继续播放须显式 `resume`，恢复以**新游标**为新一段起点重新计时，不追赶停顿时间。
+
+### 示例 25b：前跳、倒带与同刻重放（可执行）
+
+沿用前面的场景：s1 Alice`[0,1000)`、s2 Bob`[800,3000)` 锁轨 2、s3 Alice`[1000,2500)`。
+
+```bash
+# 场景 + 会话（与示例 17 相同）
+curl -s -X PUT http://localhost:8080/scenes/scene-seek \
+  -H 'Content-Type: application/json' \
+  -d '{"track_count":2,"expected_revision":0,"subtitles":[
+    {"id":"s1","speaker":"Alice","start_ms":0,"end_ms":1000},
+    {"id":"s2","speaker":"Bob","start_ms":800,"end_ms":3000,"locked_track":2},
+    {"id":"s3","speaker":"Alice","start_ms":1000,"end_ms":2500}]}' >/dev/null
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' -d '{"scene_id":"scene-seek"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+
+# 先播到 900：s1、s2 在屏
+curl -s -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 900}' >/dev/null
+
+# 前跳到 2000：跳过的 1000/2500 时刻事件不补发；
+# s1 退出、s2 两边都活动（退出再进入）、s3 进入；事件时刻全部标记为 2000
+curl -s -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": 2000}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-seek",
+  "source_revision": 1,
+  "cursor_ms": 2000,
+  "events": [
+    {"id": "s1", "speaker": "Alice", "track": 1, "time_ms": 2000, "type": "exit"},
+    {"id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 2000, "type": "exit"},
+    {"id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 2000, "type": "enter"},
+    {"id": "s3", "speaker": "Alice", "track": 1, "time_ms": 2000, "type": "enter"}
+  ],
+  "active": [
+    {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2, "track": 2},
+    {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500, "locked_track": null, "track": 1}
+  ],
+  "status": "idle"
+}
+```
+
+**倒带**：再从 2000 倒带回 500——s2、s3 退出，s1 重新进入（时刻标记为 500）；游标变为 500 后，原 `/advance`、`/events` 依旧禁止从 500 倒退，但可从 500 正常向前推进，窗口事件照常补发：
+
+```bash
+# 倒带
+curl -s -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": 500}'
+# {"…","cursor_ms":500,
+#  "events":[{"id":"s2",…,"time_ms":500,"type":"exit"},
+#            {"id":"s3",…,"time_ms":500,"type":"exit"},
+#            {"id":"s1",…,"time_ms":500,"type":"enter"}],
+#  "active":[{"id":"s1",…}],"status":"idle"}
+
+# 原推进仍禁止倒退
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/advance \
+  -H 'Content-Type: application/json' -d '{"time_ms": 499}'   # 422
+
+# 非法时间：布尔值与字符串不做隐式转换
+for t in true false '"100"' '1.5' '-1'; do
+  curl -s -o /dev/null -w "$t -> %{http_code}\n" -X POST http://localhost:8080/sessions/$SID/seek \
+    -H 'Content-Type: application/json' -d "{\"time_ms\": $t}"   # 均为 422
+done
+```
+
 ## 补取通道（channel）：推进响应丢失后补取未确认的字幕变更
 
 `/events` 与 `/hidden_speakers` 的事件只随当次响应返回，不保存历史；若显示端遇到**推进响应丢失**（网络超时、连接中断等），错过的字幕变更无从得知。补取通道为此提供一条会话内的内存事件队列：开启后，会话产生的全部 enter/exit 都按序入队，显示端随时补取未确认的事件并按序号确认。
 
 - `POST /sessions/{session_id}/channel`：**开启通道**（无请求体）。每个会话最多一个内存通道，重复开启返回 **409**（已有通道不变）。成功响应返回当前可见 `active`（与 `/advance` 相同、排除隐藏说话人）与序号 `seq: 0`——开启之前的事件不补记，客户端以本响应的 `active` 作为初始可见集合。未知或已结束会话返回 404。
-- 开启后，**普通推进（`/advance`）、事件推进（`/events`）与隐藏切换（`/hidden_speakers`）产生的全部 enter/exit** 都追加到通道队列：事件字段与排序沿用事件推进的规则（`id`/`speaker`/`track`/`time_ms`/`type`，时刻升序、同刻先退出后进入、同类按会话字幕顺序；隐藏切换的事件时刻为当前游标），每条事件分配**从 1 起连续递增的 `seq`**。普通推进的响应不变（仍不含 `events`），但它跨过的进入/退出——包括两次采样之间开始又结束的短字幕——同样完整入队；隐藏说话人的字幕不产生事件，也不入队。**接纳（`/accept`）不重写已排队内容**：队列中的事件保持入队时的内容与序号，接纳后的新事件继续递增编号。状态变更（游标推进、隐藏集合替换）与入队在同一会话锁内一同生效；开启、补取与既有会话操作完整串行；任何失败都不改会话或通道。
+- 开启后，**普通推进（`/advance`）、事件推进（`/events`）、定位（`/seek`）与隐藏切换（`/hidden_speakers`）产生的全部 enter/exit** 都追加到通道队列：事件字段与排序沿用事件推进的规则（`id`/`speaker`/`track`/`time_ms`/`type`，时刻升序、同刻先退出后进入、同类按会话字幕顺序；隐藏切换与定位的事件时刻为当前/目标游标），每条事件分配**从 1 起连续递增的 `seq`**。普通推进的响应不变（仍不含 `events`），但它跨过的进入/退出——包括两次采样之间开始又结束的短字幕——同样完整入队；隐藏说话人的字幕不产生事件，也不入队。定位不回放跳过区间、只比对两端可见活动快照（两边都活动者也退出再进入），其事件同样接续 `seq`，**时间回退仍按 seq 补取、不按时间去重**。**接纳（`/accept`）不重写已排队内容**：队列中的事件保持入队时的内容与序号，接纳后的新事件继续递增编号。状态变更（游标推进、定位、隐藏集合替换）与入队在同一会话锁内一同生效；开启、补取与既有会话操作完整串行；任何失败都不改会话或通道。
 - **共享容量（`CHANNEL_EVENT_LIMIT`）**：所有会话的补取通道共用一个“未确认事件总量”上限。该环境变量必须是**正整数**（十进制，允许首尾空白），**默认 `1024`；未设置时取默认值，配置为 `0`、负数、小数或其他非数字值时服务拒绝启动**（uvicorn 导入配置即失败），Docker Compose 中可直接配置。
-  - 上述三类生产操作按**本次实际生成的事件数**在会话锁内**原子申请**共享容量，申请与游标推进/隐藏集合替换/`seq` 分配/完整入队**一同生效**。容量不足（哪怕只够容纳批次的一部分）立即返回 **HTTP 503**，响应体给出 `limit`、本次需要的 `requested` 与当前 `available`；此时**不推进游标、不改变隐藏集合、不分配/消费 `seq`、不部分入队**，会话与通道与请求前完全一致。
-  - **未开启通道的会话不占容量**（推进、事件推进、隐藏切换都不会 503）；**无事件的操作不占名额**——等时推进、不产生显示变更的隐藏切换在满额时仍返回 200。**开启通道与接纳也不占容量**（接纳既不生产事件也不释放容量）。
+  - 上述各类生产操作（普通推进、事件推进、定位、隐藏切换）按**本次实际生成的事件数**在会话锁内**原子申请**共享容量，申请与游标推进/定位/隐藏集合替换/`seq` 分配/完整入队**一同生效**。容量不足（哪怕只够容纳批次的一部分）立即返回 **HTTP 503**，响应体给出 `limit`、本次需要的 `requested` 与当前 `available`；此时**不推进或移动游标、不改变隐藏集合、不改变自动播放计时段与播放状态、不分配/消费 `seq`、不部分入队**，会话与通道与请求前完全一致。
+  - **未开启通道的会话不占容量**（推进、事件推进、定位、隐藏切换都不会 503）；**无事件的操作不占名额**——等时推进、定位到两端均无可显活动字幕的时刻、不产生显示变更的隐藏切换在满额时仍返回 200。**开启通道与接纳也不占容量**（接纳既不生产事件也不释放容量）。
   - 容量**只在“确认并删除前缀”时**按本次实际删除的事件数释放：纯读取（`fetch` 只返回事件、`ack_seq` 未前进）与旧确认（不回退、不再次删除）**不释放**；或在**结束会话时一次性释放该通道剩余的未确认队列**——重复或并发结束最多成功一次，容量不会重复释放。被 503 拒绝的请求在确认前缀或结束其他会话腾出容量后，用**完全相同的原请求重试**即可成功（游标与隐藏集合当时都未改变）。
 - `POST /sessions/{session_id}/channel/fetch`：**补取并确认**。请求体 `{"ack_seq": N}`：
   - `ack_seq` 为**非负整数**，布尔值与字符串一律 **422**（严格整数，不做隐式转换）；
@@ -1809,6 +1892,61 @@ curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
 
 要点：满额的那一拍**整批失败**（不推进游标、不消费 `seq`、不部分入队，等价于手动推进的 503 语义但由后台转为 `blocked` 状态）；确认前缀只是腾出容量，会话**保持 blocked**，显式 `resume` 后从保留游标继续，停顿期间的墙钟时间**不会**被追回来。
 
+### 示例 30b：自动播放中定位——暂停、按 seq 补取切换事件、从新游标续播
+
+运行中的会话可以随时定位：定位与全部既有会话操作在会话锁内完整串行，成功后自动播放一律转为 **paused**（旧驱动段立即失效）；通道未确认队列与确认边界保持不变，定位的显示切换事件接续 `seq`，按 `seq` 补取即可；显式 `resume` 后从**新游标**重新计时，不追赶定位操作耗时。
+
+```bash
+# 场景 + 会话 + 通道 + 启动（沿用示例 29）
+curl -s -X PUT http://localhost:8080/scenes/scene-seek-ap \
+  -H 'Content-Type: application/json' \
+  -d '{"track_count":2,"expected_revision":0,"subtitles":[
+    {"id":"s1","speaker":"Alice","start_ms":0,"end_ms":1000},
+    {"id":"s2","speaker":"Bob","start_ms":800,"end_ms":3000,"locked_track":2},
+    {"id":"s3","speaker":"Alice","start_ms":1000,"end_ms":2500}]}' >/dev/null
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' -d '{"scene_id":"scene-seek-ap"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST http://localhost:8080/sessions/$SID/channel >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/start >/dev/null
+sleep 0.3   # 后台推进到约 300ms：s1、s2 在屏，通道里有 seq 1（s2 进入）
+
+# 运行中前跳到 2000：响应返回后 status 即为 paused，游标 2000，
+# s1/s2 先 exit、s2/s3 再 enter（时刻全部标记 2000）
+curl -s -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": 2000}'
+# {"…","cursor_ms":2000,
+#  "events":[exit s1@2000, exit s2@2000, enter s2@2000, enter s3@2000],
+#  "active":[s2, s3],"status":"paused"}
+
+# 旧驱动不得再推进：即使等待，游标仍停在 2000
+sleep 0.3
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"…","status":"paused","cursor_ms":2000}
+
+# 通道：先纯读取再确认旧前缀；定位事件接续 seq（s2 进入是 seq 1，
+# 定位的 4 条为 seq 2～5），倒带/前跳都不按时间去重
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}'
+# {"…","acked_seq":0,"events":[
+#   {"seq":1,"id":"s2","time_ms":800,"type":"enter",…},
+#   {"seq":2,"id":"s1","time_ms":2000,"type":"exit",…},
+#   {"seq":3,"id":"s2","time_ms":2000,"type":"exit",…},
+#   {"seq":4,"id":"s2","time_ms":2000,"type":"enter",…},
+#   {"seq":5,"id":"s3","time_ms":2000,"type":"enter",…}]}
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 5}' >/dev/null   # 确认并释放
+
+# 显式恢复：从新游标 2000 开新计时段（不追赶刚才的 0.3 秒）
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/resume
+# {"…","status":"running","cursor_ms":2000}
+sleep 0.3
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"…","status":"running","cursor_ms":2298 左右}   # 2000 + 恢复后真实经过
+```
+
+定位时通道容量不足同样返回 **503**（游标、队列、`seq`、计时段、播放状态均不变），确认前缀释放容量后用同一请求重试；从未启动（idle）的会话定位后仍是 idle，不需要恢复。
+
 ### 启动/恢复的等锁计时修复说明
 
 此前 `POST /sessions/{id}/autoplay/start` 与 `POST /sessions/{id}/autoplay/resume` 在**进入会话锁之前**读取单调时钟：当同一会话的接纳等操作正持锁时，控制请求**先取时、再排队等锁**，锁外等待的时长被算进本段计时——生效后的第一拍会把等锁时间额外推进到游标上，落在该区间内的字幕事件被**提前入队**（并消耗 `seq`）。
@@ -1886,6 +2024,7 @@ curl -s -o /dev/null -X POST http://localhost:8080/sessions/$SID/finish
 - `idle`（未启动）时一切旧行为不变：手动 `/advance`、`/events`、隐藏、接纳、通道、结束都照旧；自动播放是**叠加**在通道之上的可选驱动，不开通道即与旧版本完全一致。
 - `running` 时仅禁止两种手动推进（409）；隐藏切换照常（与后台推进串行，显示变更事件照常入队），`/accept` 照常（接纳后后台按新快照继续推进，已开始字幕冻结规则不变），`/channel/fetch` 照常拉取自动推进产生的事件。
 - `paused`/`blocked` 时可手动推进（满额仍 503）、可切换隐藏、可接纳、可补取；这些操作改变的游标就是随后 `resume` 的本段起始游标。
+- **定位（`/seek`）在四种状态下都可用**：`idle` 定位后仍 idle；`running`/`paused`/`blocked` 定位后一律变为 `paused`（定位即暂停，旧计时段失效，须显式 resume 从新游标重新计时）；定位与后台推进在会话锁内完整串行，容量不足 503 时播放状态也不变。
 
 ## 播放存档（checkpoint）：跨重启续播，保留未确认显示事件
 
