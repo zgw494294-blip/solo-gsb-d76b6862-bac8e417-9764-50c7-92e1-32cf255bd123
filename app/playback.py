@@ -73,6 +73,17 @@
   串行。暂停返回后在途后台任务进锁即见非 running，不会再推进；结束会话
   即停止对它的驱动（注册表移除后旧任务取不到它），按原规则释放容量，
   之后一切请求 404。驱动状态仅存于本进程内存，不跨重启，旧接口响应不变。
+- 定位（seek）：把游标直接前跳或倒带到指定非负整数时刻（允许倒退，
+  与推进的只能不减不同），并同步切换显示字幕。跳过区间不补发事件：
+  只按当前快照与隐藏集合比较新旧位置的可见活动字幕——原可见 active
+  逐条发 exit、目标 active 逐条发 enter（两边都活动者也退出再进入），
+  事件沿用原字段、时刻均标目标时刻，先 exit 后 enter、同类按会话字幕
+  顺序。已开通道保留未确认队列与确认边界，新事件接续 seq 连续编号，
+  时间回退仍按 seq 补取；容量不足抛 ChannelCapacityExhausted（503），
+  游标、队列、seq、计时段与播放状态均不变。成功后除从未启动（idle）
+  外一律转为暂停（paused），定位返回后旧驱动不再推进，resume 从新
+  游标重新计时。定位与既有会话操作在会话锁内完整串行；不改快照、
+  隐藏集合或接纳规则，原推进仍禁止倒退。
 - 播放存档（checkpoint）：已开启补取通道且自动播放非运行状态的会话可
   存档。资格检查、状态序列化（完整快照、游标、隐藏集合、通道未确认
   事件与 next_seq/acked_seq/max_returned_seq 序号边界）与调用方的
@@ -91,7 +102,7 @@
   独立会话，后续操作不修改存档或其他会话。
 
 会话只存在于本进程内存中，不随重启保留。同一会话上的推进、事件推进、
-隐藏切换、接纳、结束与补取通道的开启/补取通过会话级互斥锁串行化：
+隐藏切换、定位、接纳、结束与补取通道的开启/补取通过会话级互斥锁串行化：
 每次调用要么完整生效，要么完全无效。
 接纳是一个完整操作——场景快照的读取（load_record 回调）、已开始字幕
 校验、分轨重算与会话替换都在会话锁内完成，因此并发下迟到的接纳请求
@@ -736,6 +747,89 @@ class PlaybackManager:
                 "hidden_speakers": list(hidden_speakers),
                 "events": events,
                 "active": session.active(),
+            }
+
+    def seek(self, session: PlaybackSession, time_ms: int) -> Dict[str, Any]:
+        """定位：把游标直接前跳或倒带到 time_ms，并同步切换显示字幕。
+
+        与推进不同，定位允许倒退，也**不为跳过的区间补发事件**：只按当前
+        快照与隐藏集合比较新旧两个游标位置的可见活动字幕——
+
+        - 旧游标处可见（未隐藏且处于 [start_ms, end_ms) 活动区间）的
+          字幕逐条发 exit；
+        - 目标时刻处可见的字幕逐条发 enter；
+        - 两边都活动的字幕同样先退出再进入（显示端据此整体重挂字幕）；
+        - 事件沿用事件推进的字段（id/speaker/track/time_ms/type），
+          time_ms 一律取目标时刻；先全部 exit 后全部 enter，同类按会话
+          字幕顺序。
+
+        已开启补取通道时，未确认队列与确认边界（acked_seq/max_returned_seq）
+        原样保留，本次显示事件接着 next_seq 连续编号入队——即使时间回退，
+        补取仍只按 seq 进行。入队前按事件数原子申请共享容量，不足抛
+        ChannelCapacityExhausted（HTTP 503）：游标、队列、seq、自动播放
+        计时段与播放状态均不改变，客户端可在确认前缀/结束会话释放容量后
+        用原请求重试；0 个事件不占名额，满额时仍可定位。
+
+        成功后自动播放状态除从未启动（idle 保持 idle）外一律转为暂停
+        （paused）：运行中的会话在定位返回后即不再被后台驱动推进（状态
+        在会话锁内切换，在途 tick 进锁即见非 running）；之后 resume 以
+        新游标作为新一段起点重新计时，不追赶停顿时间。定位与推进、事件
+        推进、隐藏切换、接纳、结束、通道开启/补取等在会话锁内完整串行；
+        会话已结束抛 SessionFinished。快照、隐藏集合与接纳规则不受影响；
+        time_ms 的非负严格整数校验（拒绝布尔值与字符串）由 HTTP 层完成。
+        """
+        with session.lock:
+            if session.closed:
+                raise SessionFinished(session.session_id)
+            old_cursor = session.cursor_ms
+            hidden = session.hidden_speakers
+            exits: List[Tuple[int, Dict[str, Any]]] = []
+            enters: List[Tuple[int, Dict[str, Any]]] = []
+            for order, (sub, track) in enumerate(
+                zip(session.subtitles, session.tracks)
+            ):
+                # 隐藏说话人的字幕两边都不算可见，不产生显示事件
+                if sub["speaker"] in hidden:
+                    continue
+                base = {
+                    "id": sub["id"],
+                    "speaker": sub["speaker"],
+                    "track": track,
+                }
+                if sub["start_ms"] <= old_cursor < sub["end_ms"]:
+                    exits.append(
+                        (order, {**base, "time_ms": time_ms, "type": "exit"})
+                    )
+                if sub["start_ms"] <= time_ms < sub["end_ms"]:
+                    enters.append(
+                        (order, {**base, "time_ms": time_ms, "type": "enter"})
+                    )
+            exits.sort(key=lambda item: item[0])
+            enters.sort(key=lambda item: item[0])
+            # 先 exit 后 enter；同类已按会话字幕顺序
+            events = [item[1] for item in exits] + [
+                item[1] for item in enters
+            ]
+            # 容量申请成功之前不移动游标、不分配/消费 seq、不入队、
+            # 不改自动播放计时段与播放状态
+            if session.channel is not None:
+                self._channel_capacity.reserve(len(events))
+            session.cursor_ms = time_ms
+            # 除从未启动外一律转为暂停：后台驱动进锁即见非 running，不会
+            # 再按旧计时段推进；resume 时以新游标重新读取单调时钟开新段。
+            if session.autoplay_status != AUTOPLAY_IDLE:
+                session.autoplay_status = AUTOPLAY_PAUSED
+            # 与游标定位一同生效：显示事件接续原有序号入队（未开启则无操作）
+            _channel_append(session, events)
+            return {
+                "session_id": session.session_id,
+                "scene_id": session.scene_id,
+                "source_revision": session.source_revision,
+                "cursor_ms": session.cursor_ms,
+                "events": events,
+                "active": session.active(),
+                "status": session.autoplay_status,
+                "autoplay_status": session.autoplay_status,
             }
 
     def open_channel(self, session: PlaybackSession) -> Dict[str, Any]:

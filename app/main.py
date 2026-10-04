@@ -86,8 +86,17 @@ app = FastAPI(
         "不足 503 且不留会话或容量占用，并发不超额；事件、序号与确认边界保留，"
         "idle 仍为 idle、paused/blocked 恢复为 paused，续播重新计时、不追赶"
         "离线时间；存档可重复恢复，后续操作不改存档或其他会话。"
+        "播放会话还可按 session_id 与非负整数 time_ms（严格整数，拒绝布尔值"
+        "与字符串）定位：游标直接前跳或倒带到目标时刻，跳过区间不补发事件，"
+        "只按当前快照与隐藏集合为原可见 active 逐条发 exit、为目标 active 发"
+        "enter（两边都活动者也退出再进入），事件沿用原字段、均标目标时刻，"
+        "先 exit 后 enter、同类按字幕顺序；已开通道保留未确认队列与确认边界，"
+        "新事件接续 seq，容量不足 503 且游标、队列、seq、计时段与播放状态均"
+        "不变；成功后除未启动外均为暂停，恢复从新游标重新计时；定位与既有"
+        "会话操作完整串行，未知或已结束会话 404、非法时间 422，快照、隐藏"
+        "集合、接纳规则与旧接口不变。"
     ),
-    version="1.11.0",
+    version="1.12.0",
 )
 
 
@@ -472,6 +481,45 @@ class AutoplayStateResponse(BaseModel):
         ..., description="自动播放状态：未启动/运行/暂停/阻塞"
     )
     cursor_ms: int = Field(..., description="当前播放游标（毫秒）")
+
+
+class SeekRequest(BaseModel):
+    """定位请求：目标时刻为严格非负整数。
+
+    time_ms 使用严格整数（strict）：布尔值（true/false 会被 Python 视为
+    int 子类）与数字字符串一律按 422 拒绝，不做隐式转换。
+    """
+
+    time_ms: int = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description="定位到的时刻（毫秒，非负整数，拒绝布尔值与字符串）",
+    )
+
+
+class SeekResponse(BaseModel):
+    """定位结果：游标、源版本、可见活动字幕、显示事件与自动播放状态。
+
+    跳过区间不补发事件：events 为新旧两个位置的显示切换——原可见
+    active 逐条 exit、目标 active 逐条 enter（两边都活动者也退出再
+    进入），事件沿用事件推进的字段、时刻均标目标时刻，先 exit 后
+    enter、同类按会话字幕顺序。定位成功后自动播放除从未启动（idle）
+    外一律为暂停（paused）。
+    """
+
+    session_id: str
+    scene_id: str
+    source_revision: int
+    cursor_ms: int
+    events: List[SubtitleEventOut]
+    active: List[ActiveSubtitleOut]
+    status: Literal["idle", "paused"] = Field(
+        ..., description="定位后的自动播放状态：未启动（idle）或已暂停（paused）"
+    )
+    autoplay_status: Literal["idle", "paused"] = Field(
+        ..., description="status 的同义字段（与自动播放接口命名一致）"
+    )
 
 
 class CheckpointSaveResponse(BaseModel):
@@ -1400,6 +1448,55 @@ def get_session_autoplay(session_id: str) -> AutoplayStateResponse:
     未启动的会话返回 idle；未知或已结束会话返回 404。
     """
     return _autoplay_call(session_id, lambda pb, s: pb.autoplay_status_of(s))
+
+
+# ---------------------------------------------------------------------------
+# 定位（seek）：前跳或倒带到指定时刻，同步切换显示字幕
+# ---------------------------------------------------------------------------
+
+
+@app.post("/sessions/{session_id}/seek", response_model=SeekResponse)
+def seek_session(session_id: str, req: SeekRequest) -> SeekResponse:
+    """定位：把游标直接前跳或倒带到 time_ms，并同步切换显示字幕。
+
+    请求体 `{"time_ms": N}`：N 为**严格非负整数**（布尔值与字符串一律
+    422，不做隐式转换）。与推进的“只能不减”不同，定位允许倒退；跳过
+    区间**不补发事件**，只按当前快照与隐藏集合比较新旧两个位置的可见
+    活动字幕：
+
+    - 原可见 active（旧游标处未隐藏且处于 `[start_ms, end_ms)` 区间）
+      逐条发 `exit`，目标时刻可见者逐条发 `enter`；两边都活动的字幕
+      同样先退出再进入；
+    - 事件沿用事件推进的字段（`id`/`speaker`/`track`/`time_ms`/`type`），
+      `time_ms` 均标**目标时刻**；先全部 `exit` 后全部 `enter`，同类按
+      会话字幕顺序；
+    - 响应含定位后的游标、源版本、可见 `active`、显示事件与自动播放
+      状态（`status` 与 `autoplay_status` 同义）。
+
+    已开启补取通道时，未确认队列与确认边界（`acked_seq`/
+    `max_returned_seq`）原样保留，本次显示事件**接续 `next_seq` 连续
+    编号**入队——即使时间回退，补取仍只按 `seq` 进行。容量不足返回
+    **503**：游标、队列、`seq`、自动播放计时段与播放状态均不改变，
+    确认前缀或结束会话释放容量后可用原请求重试。
+
+    定位成功后自动播放除从未启动（`idle` 保持 `idle`）外一律转为
+    **暂停**（`paused`）：运行中的会话在定位返回后即不再被后台驱动
+    推进；之后 `autoplay/resume` 以新游标作为新一段起点重新计时，
+    不追赶停顿时间。定位与推进、事件推进、隐藏切换、接纳、结束、
+    通道开启/补取等在会话锁内**完整串行**。未知或已结束会话返回
+    **404**，非法时间返回 **422**。快照、隐藏集合与接纳规则不受影响；
+    原推进接口仍禁止倒退，旧接口的请求与响应不变。
+    """
+    session = _get_session_or_404(session_id)
+    try:
+        state = get_playback().seek(session, req.time_ms)
+    except SessionFinished:
+        # 已取得引用但轮到生效时会话已被结束：与未知会话同等待遇
+        raise _session_gone_404(session_id)
+    except ChannelCapacityExhausted as exc:
+        # 共享容量不足：游标、队列、seq、计时段与播放状态均未改变
+        raise _channel_full_503(exc)
+    return SeekResponse(**state)
 
 
 @app.post("/sessions/{session_id}/accept", response_model=SessionStateResponse)

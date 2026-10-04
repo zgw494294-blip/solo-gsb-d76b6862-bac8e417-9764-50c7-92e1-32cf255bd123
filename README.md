@@ -14,6 +14,7 @@
 - 播放会话可开启一个**补取通道（channel）**，让显示端在**推进响应丢失后仍能补取未确认的字幕变更**：`POST /sessions/{id}/channel` 每会话开启一个内存通道（重复开启 409），返回当前可见 `active` 与序号 0；此后普通推进、事件推进与隐藏切换产生的全部 enter/exit 按事件字段与排序入队，`seq` 从 1 连续编号，短字幕不漏记，接纳不重写已排队内容。`POST /sessions/{id}/channel/fetch` 提交 `ack_seq`（严格非负整数，拒绝布尔值与字符串）补取：只能确认此前补取已返回的最大 `seq` 以内的前缀（越界 422，旧确认不回退），返回确认位置与剩余未确认事件（按 `seq` 递增，重复补取内容与序号不变）。状态变更与入队一同生效，开启、补取与既有会话操作完整串行，失败不改会话或通道；结束会话清除通道，未知或已结束会话、未开启通道均 404。通道仅内存态：不跨重启恢复、不做后台推送，旧接口响应不变。**通道共享容量**由环境变量 `CHANNEL_EVENT_LIMIT` 配置（正整数，默认 1024，非法配置拒绝启动，可在 Compose 中配置）：它是**单进程内所有会话未确认事件总量**的上限。普通推进、事件推进与隐藏切换须按**本次实际生成的事件数**原子申请共享容量，申请与状态变更、`seq` 分配、完整入队一同生效；容量不足立即返回 **503**——不推进游标、不改变隐藏集合、不消费 `seq`、不部分入队。**未开启通道的操作不占容量**；**无事件的操作在满额时仍可执行**。容量**仅在补取确认并删除前缀时**按删除数量释放（纯读取与旧确认不释放），或在**结束会话时释放该通道剩余队列**（重复/并发结束不重复释放）；释放后被 503 拒绝的原请求可原样重试。
 - 已开启补取通道的会话还可启动**自动播放（autoplay）**：客户端不再逐次提交推进时间，进程内后台驱动**每 50 毫秒**按真实经过时间自动推进，目标为**本段起始游标 + 单调时钟经过的整毫秒**（`time.monotonic`，毫秒取整）。HTTP 接口按 `session_id` **启动 / 暂停 / 恢复 / 查询**，返回 `idle`（未启动）/ `running`（运行）/ `paused`（暂停）/ `blocked`（满额阻塞）状态与当前游标。启动仅限**已开补取通道且从未启动**的会话（未开通道或已启动返回 409）；暂停仅限 running，恢复仅限 paused 或 blocked，其余状态迁移均 409；未知或已结束会话 404。**暂停、阻塞不计时**，恢复以保留游标作为新一段起点重新计时，**不追赶**停顿时间；启动与恢复的计时段起点在**会话锁内、控制请求串行生效的同一时刻**读取——同会话接纳等操作持锁时，控制请求在锁外等待的间隔不计入计时，生效后不会把等锁时长额外推进到游标上、也不会提前入队字幕事件。后台推进沿用事件窗口、隐藏过滤、排序、`seq` 与共享容量的**全部既有规则**：一次推进的整批事件原子入队，共享容量不足时整批转为 `blocked`——游标、`seq` 与队列保持原样；确认释放容量后**必须显式恢复**才继续，且不追赶停顿。**运行中两种手动推进（`/advance`、`/events`）返回 409**，未启动/暂停/阻塞时仍可手动推进；隐藏切换、接纳、补取等其他既有会话操作在四种状态下仍可用并与后台推进完整串行。**驱动每拍以非阻塞方式进入各会话锁**：某个会话的锁被占用（典型场景：先创建的会话保存播放存档，保存的资格检查、状态采集与 SQLite 提交在同一次会话锁持锁内完成，而写库正在等待 SQLite 写锁）时，驱动本拍**跳过该会话、绝不挂在它的锁上**，因此后创建的其他运行会话的游标推进与事件入队不会被拖停——未被占用的运行会话仍**每 50 毫秒**被尝试推进一次；被占用会话与其自身操作保持严格串行（后台从不在锁外改动它），锁释放后若该会话仍运行，下一拍**按原计时段一次性补齐**跳过期间应推进的游标与整批事件（沿用事件窗口、排序、连续 `seq` 与共享容量规则），跳过期间已暂停或已结束的会话则不再推进。暂停返回后在途后台任务进锁即见非 running，不可能再推进；结束会话即停止对它的驱动（注册表移除后旧任务取不到它）、按原规则释放通道容量，之后该 id 一切请求 404。自动播放驱动状态**仅存单进程内存**，不跨重启，旧接口的请求与响应完全不变。
 - 已开补取通道、自动播放未在运行的播放会话还可保存**播放存档（checkpoint）**以支持**跨重启续播**：`PUT /sessions/{id}/checkpoints/{checkpoint_id}`（或集合式 `POST /sessions/{id}/checkpoints`）按 `session_id` 与非空 `checkpoint_id` 把存档写入场景同一个 SQLite；仅**已开通道且自动播放处于非运行状态**（idle/paused/blocked）可保存，未开通道或运行中返回 **409**。存档的**资格检查、状态采集与 SQLite 提交在同一次会话锁持锁内完成**，存档含**完整快照、游标、隐藏集合、通道未确认事件及 `next_seq`、`acked_seq`、`max_returned_seq`** 序号边界：写库等待（如 SQLite 写锁被其他写入占用）期间同会话操作不会先完成，写入失败回滚、不留存档、不改会话或通道容量并释放等待中的操作；成功**不结束会话**，失败不留存档（同名存档 **409**、未知会话 **404**、非法 id **422**）。`POST /checkpoints/{checkpoint_id}/restore` 按存档恢复为**全新 `session_id`** 的会话，**不读取当前场景**；事件、序号与确认边界保留，后续新事件接着 `next_seq` 连续编号；未启动者恢复后仍未启动，暂停或阻塞者恢复为**暂停**（显式恢复才续播，**重新计时、不追赶离线时间**）。队列按存档未确认事件数**计入共享容量**，容量不足返回 **503** 且不留会话或容量占用，并发恢复不可能超额。同一份存档可**重复恢复**为互不影响的独立会话，恢复及后续操作都不修改存档或其他会话；恢复响应含新会话 id、完整快照与播放状态。旧接口的请求与响应完全不变。
+- 播放会话还可**定位（seek）**：`POST /sessions/{id}/seek` 接收非负整数 `time_ms`（**严格整数，布尔值与字符串一律 422**），把游标直接**前跳或倒带**到目标时刻（与推进的“只能不减”不同，允许倒退）并同步切换显示字幕。**跳过区间不补发事件**：只按当前快照与隐藏集合比较新旧两个位置的可见活动字幕——原可见 active 逐条发 `exit`、目标 active 逐条发 `enter`（**两边都活动者也退出再进入**），事件沿用原字段、**时刻均标目标时刻**，先 `exit` 后 `enter`、同类按会话字幕顺序；响应含游标、源版本、可见 `active`、显示事件与自动播放状态。已开通道**保留未确认队列与确认边界**，新事件**接续 `seq`** 连续编号，时间回退仍按 `seq` 补取；容量不足返回 **503**——游标、队列、`seq`、计时段与播放状态均不变，释放容量后可原样重试。定位成功后自动播放**除未启动（idle）外一律转为暂停**：运行中的会话定位返回后旧驱动不再推进，`resume` 从**新游标**重新计时、不追赶停顿。定位与既有会话操作完整串行；未知或已结束会话 **404**、非法时间 **422**；快照、隐藏集合与接纳规则不变，原推进接口仍禁止倒退，旧接口不变。
 
 ## 一条命令启动
 
@@ -2318,6 +2319,161 @@ curl -s -X POST http://localhost:8080/sessions/$SID_B/finish >/dev/null
 
 > 说明：写锁持有期间对 A 的**同会话**状态查询（如 `GET /sessions/$SID_A/autoplay`）会按既有串行规则在 A 的会话锁外排队，直到存档完成——这正是“同会话操作不穿插”的语义；而**其他会话**（如 B）的一切操作与自动推进都不等待 A，照常每 50ms 推进。
 
+## 定位（seek）：前跳或倒带到指定时刻，同步切换显示字幕
+
+推进（`/advance`、`/events`）的游标只能不减；要**跳到之前或之后的某个时刻**（用户拖动进度条、倒带重看）用定位接口：`POST /sessions/{session_id}/seek`，请求体 `{"time_ms": N}`。`N` 为**严格非负整数**——布尔值与数字字符串一律 **422**（不做隐式转换），负数、浮点、缺失字段同样 422。定位允许倒退，也允许一次跨过任意区间。
+
+- **跳过区间不补发事件**：与事件推进的“（旧游标, time_ms] 窗口全量事件”不同，定位**不**为跨过的区间生成进入/退出；只按**当前快照与隐藏集合**比较新旧两个游标位置的可见活动字幕：
+  - 旧游标处可见（未隐藏且处于 `[start_ms, end_ms)` 区间）的字幕**逐条发 `exit`**，目标时刻可见者**逐条发 `enter`**；
+  - **两边都活动的字幕同样先退出再进入**（显示端据此把在屏字幕整体重挂到目标时刻，无需自己 diff）；
+  - 事件沿用事件推进的字段（`id`/`speaker`/`track`/`time_ms`/`type`），`time_ms` **均标目标时刻**；先全部 `exit` 后全部 `enter`，同类按会话字幕顺序；定位到当前时刻也会对全部可见 active 发一遍退出/进入。
+- 响应含 `session_id`、`scene_id`、`source_revision`、定位后的 `cursor_ms`、显示 `events`、目标时刻的可见 `active`，以及自动播放状态（`status` 与 `autoplay_status` 同义，定位后只会是 `idle` 或 `paused`）。
+- **通道与容量**：已开启补取通道时，未确认队列与确认边界（`acked_seq`/`max_returned_seq`）**原样保留**，本次显示事件**接续 `next_seq` 连续编号**入队——即使时间回退，补取仍只按 `seq` 递增进行，客户端无需区分事件来自推进还是定位。容量规则与推进、隐藏切换相同：按本次实际事件数原子申请共享容量，不足返回 **503**（`detail` 给出 `limit`/`requested`/`available`）——**游标、队列、`seq`、自动播放计时段与播放状态均不改变**，确认前缀或结束会话释放容量后用**完全相同的原请求**重试即可；未开通道不占容量，两侧皆空的 0 事件定位在满额时仍可执行。
+- **自动播放联动**：定位成功后，自动播放状态**除从未启动（`idle` 保持 `idle`）外一律转为 `paused`**——运行中的会话可以不等暂停直接定位，定位返回后旧驱动不再推进它（状态在会话锁内切换，在途后台拍进锁即见非 running）；之后 `autoplay/resume` 以**新游标**作为新一段起点重新计时，**不追赶**停顿时间。容量不足被 503 拒绝的定位不改变任何状态：运行中的会话继续按原计时段运行。
+- **串行与错误码**：定位与推进、事件推进、隐藏切换、接纳、结束、通道开启/补取在会话锁内**完整串行**；未知或已结束会话返回 **404**，非法时间返回 **422**，任何失败都不改变会话。定位**不改快照、隐藏集合与接纳规则**；原推进接口仍禁止倒退（定位回退后再用 `/advance` 仍只能不减），旧接口的请求与响应字段不变。
+
+### 示例 37：定位——前跳、倒带与补取（事件接续 seq）
+
+创建场景 `scene-seek`（s1 `[0,1000)`、s2 `[800,3000)` 锁轨 2、s3 `[1000,2500)`，分轨 1/2/1），建会话、开通道，先事件推进到 1000（s2 进入、s1 退出、s3 进入入队为 seq 1～3）：
+
+```bash
+curl -s -X PUT http://localhost:8080/scenes/scene-seek \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "track_count": 2,
+    "expected_revision": 0,
+    "subtitles": [
+      {"id": "s1", "speaker": "Alice", "start_ms": 0,    "end_ms": 1000},
+      {"id": "s2", "speaker": "Bob",   "start_ms": 800,  "end_ms": 3000, "locked_track": 2},
+      {"id": "s3", "speaker": "Alice", "start_ms": 1000, "end_ms": 2500}
+    ]
+  }' >/dev/null
+
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id": "scene-seek"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST http://localhost:8080/sessions/$SID/channel >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/events \
+  -H 'Content-Type: application/json' -d '{"time_ms": 1000}' >/dev/null
+```
+
+**倒带**回 500：1000 处可见 s2、s3，500 处仅 s1 可见——两条 exit 一条 enter，时刻均标目标时刻 500；未启动自动播放，状态保持 `idle`：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": 500}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-seek",
+  "source_revision": 1,
+  "cursor_ms": 500,
+  "events": [
+    {"id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 500, "type": "exit"},
+    {"id": "s3", "speaker": "Alice", "track": 1, "time_ms": 500, "type": "exit"},
+    {"id": "s1", "speaker": "Alice", "track": 1, "time_ms": 500, "type": "enter"}
+  ],
+  "active": [
+    {"id": "s1", "speaker": "Alice", "start_ms": 0, "end_ms": 1000, "locked_track": null, "track": 1}
+  ],
+  "status": "idle",
+  "autoplay_status": "idle"
+}
+```
+
+**补取**：定位事件接续 seq 4～6 入队；时间回退了，补取仍只按 seq 递增——确认边界与越界规则完全不变：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 0}'
+```
+
+```json
+{
+  "session_id": "…",
+  "scene_id": "scene-seek",
+  "acked_seq": 0,
+  "events": [
+    {"seq": 1, "id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 800,  "type": "enter"},
+    {"seq": 2, "id": "s1", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "exit"},
+    {"seq": 3, "id": "s3", "speaker": "Alice", "track": 1, "time_ms": 1000, "type": "enter"},
+    {"seq": 4, "id": "s2", "speaker": "Bob",   "track": 2, "time_ms": 500,  "type": "exit"},
+    {"seq": 5, "id": "s3", "speaker": "Alice", "track": 1, "time_ms": 500,  "type": "exit"},
+    {"seq": 6, "id": "s1", "speaker": "Alice", "track": 1, "time_ms": 500,  "type": "enter"}
+  ]
+}
+```
+
+**前跳**到 3000（跨过 s1 的退出与 s2、s3 的整段）：跳过区间不补发，只有 500 处可见的 s1 发一条 exit（3000 处已无任何活动字幕）；确认前 6 条后再补取即可看到它接续为 seq 7：
+
+```bash
+curl -s -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": 3000}'
+# {"…","cursor_ms":3000,
+#  "events":[{"id":"s1","speaker":"Alice","track":1,"time_ms":3000,"type":"exit"}],
+#  "active":[],"status":"idle","autoplay_status":"idle"}
+
+curl -s -X POST http://localhost:8080/sessions/$SID/channel/fetch \
+  -H 'Content-Type: application/json' -d '{"ack_seq": 6}'
+# {"…","acked_seq":6,
+#  "events":[{"seq":7,"id":"s1","speaker":"Alice","track":1,"time_ms":3000,"type":"exit"}]}
+```
+
+非法时间一律 422 且会话不变（严格整数，拒绝布尔值与字符串）：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": -100}'   # 422（负数）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": true}'   # 422（布尔）
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": "500"}'  # 422（字符串）
+```
+
+容量不足时定位返回 503 且什么都不变（与示例 28 同一规则）：把 `CHANNEL_EVENT_LIMIT` 调小、让通道未确认事件占满容量后，需要 4 条显示事件的定位整体失败——游标、队列、`seq`、计时段与播放状态保持原样，确认前缀释放容量后用**同一请求**重试即成功，新事件仍接续原 `seq`。
+
+### 示例 38：自动播放中定位——转为暂停，恢复从新游标续播
+
+运行中的会话可以**不先暂停**直接定位：定位成功即转为 `paused`，旧驱动不再推进；`resume` 从**新游标**重新计时，停顿时间不追赶。
+
+```bash
+SID=$(curl -s -X POST http://localhost:8080/sessions \
+  -H 'Content-Type: application/json' -d '{"scene_id": "scene-seek"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["session_id"])')
+curl -s -X POST http://localhost:8080/sessions/$SID/channel >/dev/null
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/start
+# {"session_id":"…","status":"running","cursor_ms":0}
+sleep 0.3
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"…","status":"running","cursor_ms":301}   <- 后台按真实时间推进
+
+# 运行中直接定位到 5000：200，状态转为 paused，游标停在 5000
+# （301 处可见的 s1 发一条 exit；5000 处无活动字幕，无 enter）
+curl -s -X POST http://localhost:8080/sessions/$SID/seek \
+  -H 'Content-Type: application/json' -d '{"time_ms": 5000}'
+# {"…","cursor_ms":5000,
+#  "events":[{"id":"s1","speaker":"Alice","track":1,"time_ms":5000,"type":"exit"}],
+#  "active":[],"status":"paused","autoplay_status":"paused"}
+
+# 定位返回后旧驱动不再推进：游标停在 5000
+sleep 0.3
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"…","status":"paused","cursor_ms":5000}
+
+# 续播：显式 resume，从新游标 5000 重新计时，不追赶停顿的 0.3 秒
+curl -s -X POST http://localhost:8080/sessions/$SID/autoplay/resume
+# {"…","status":"running","cursor_ms":5000}
+sleep 0.2
+curl -s http://localhost:8080/sessions/$SID/autoplay
+# {"…","status":"running","cursor_ms":5201}   <- 约 5000+200，而不是 5000+500
+
+curl -s -o /dev/null -X POST http://localhost:8080/sessions/$SID/finish
+```
+
+要点：定位是除暂停外**唯一**能让运行会话停下的定位类操作——它把“暂停 + 跳时刻 + 显示重挂”合成一次串行生效的操作；未启动（`idle`）的会话定位后仍是 `idle`，可随后手动推进或 `autoplay/start`；暂停/阻塞中的会话定位后仍为 `paused`。
+
 ## 本地开发与测试（不使用 Docker）
 
 需 Python 3.11+：
@@ -2352,10 +2508,10 @@ python tests/test_solver.py
 
 ```
 app/
-  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat、会话结束 /sessions/{id}/finish、补取通道 /sessions/{id}/channel(/fetch)、自动播放 /sessions/{id}/autoplay/(start|pause|resume) 与播放存档 /sessions/{id}/checkpoints(/{cp_id})、/checkpoints/{cp_id}/restore
+  main.py      # FastAPI 路由与请求/响应模型（Pydantic 校验），含片段另存 /scenes/{id}/clip、场景拼接 /scenes/concat、会话结束 /sessions/{id}/finish、补取通道 /sessions/{id}/channel(/fetch)、自动播放 /sessions/{id}/autoplay/(start|pause|resume)、定位 /sessions/{id}/seek 与播放存档 /sessions/{id}/checkpoints(/{cp_id})、/checkpoints/{cp_id}/restore
   solver.py    # 纯 Python 求解器与业务校验（无第三方依赖）
   storage.py   # 场景持久化：本地 SQLite（乐观锁版本控制；片段/拼接核对全部源版本与创建目标为同一事务；playback_checkpoints 表保存跨重启播放存档）
-  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认；CHANNEL_EVENT_LIMIT 共享容量随生产原子申请、确认前缀/结束释放）、自动播放（每 50ms 按单调时钟整批推进，驱动非阻塞进锁、被占用会话本拍跳过不拖停其他运行会话，解锁后仍 running 按原计时段补齐、已暂停/结束不推进；满额转 blocked、确认后显式恢复，暂停/阻塞不计时、不追赶；状态机 idle/running/paused/blocked）、播放存档（资格检查、状态采集与 SQLite 提交在同一次会话锁持锁内完成，写库等待期间同会话操作不穿插、驱动跳过不拖停其他会话；恢复为全新会话、队列计入共享容量、idle 保 idle/paused/blocked 转 paused 重新计时不追赶）与保轨重算
+  playback.py  # 播放会话：单进程内存态，推进/事件推进/临时隐藏说话人/补取通道/接纳/结束串行化（接纳含场景读取的完整操作；结束一次取回最终快照并移除注册表；通道记录全部 enter/exit 供丢响应后补取确认；CHANNEL_EVENT_LIMIT 共享容量随生产原子申请、确认前缀/结束释放）、自动播放（每 50ms 按单调时钟整批推进，驱动非阻塞进锁、被占用会话本拍跳过不拖停其他运行会话，解锁后仍 running 按原计时段补齐、已暂停/结束不推进；满额转 blocked、确认后显式恢复，暂停/阻塞不计时、不追赶；状态机 idle/running/paused/blocked）、定位（前跳/倒带到指定时刻，跳过区间不补发，原可见 active 逐条 exit、目标 active 逐条 enter、两边都活动者也退出再进入，事件均标目标时刻、同类按字幕顺序；通道保留队列与确认边界、新事件接续 seq，容量不足 503 且游标/队列/seq/计时段/播放状态不变；成功后除 idle 外均为 paused，恢复从新游标重新计时）、播放存档（资格检查、状态采集与 SQLite 提交在同一次会话锁持锁内完成，写库等待期间同会话操作不穿插、驱动跳过不拖停其他会话；恢复为全新会话、队列计入共享容量、idle 保 idle/paused/blocked 转 paused 重新计时不追赶）与保轨重算
 tests/
   conftest.py            # pytest 夹具（场景接口使用临时数据库、会话隔离）
   test_solver.py         # 求解器单元测试
@@ -2371,6 +2527,7 @@ tests/
   test_autoplay.py       # 自动播放：状态机 409/404、真实时间推进与本段起点、暂停不计时/恢复不追赶、满额整批转 blocked（游标/seq/队列不变）/确认后显式恢复、运行中手动推进 409、其他操作串行、结束停止驱动并释放容量（含注入时钟的确定性管理器测试）、启动/暂停恢复/阻塞恢复的等锁不计时回归（可控时钟 + 线程交错）与无竞争路径
   test_driver_lock_skip.py # 驱动不被单会话长持锁拖停的回归：非阻塞进锁跳过后其他运行会话照常每拍推进（存档等写锁、运行会话接纳持锁）、解锁后按原计时段补齐事件（连续 seq/满额整批阻塞）、占用期间暂停/结束者解锁后不推进、HTTP + 真实 SQLite 写锁端到端冒烟
   test_checkpoint.py     # 播放存档：保存前置条件（已开通道/非 running）、同名 409、404/422、存档内容（快照/游标/隐藏/通道事件与序号边界）、恢复为新会话且不读场景、序号与确认边界保留、idle 保 idle/paused/blocked 转 paused、resume 重新计时不追赶、重复恢复独立、恢复 503 不留会话/占用、并发不超额、模拟重启后恢复、旧接口不变、保存等写锁/提交失败/正常保存的可控交错回归
+  test_seek.py           # 定位：前跳/倒带/原位/零点/越末、跳过区间不补发、exit 先于 enter 且同类按字幕顺序、均标目标时刻、隐藏集合两端过滤、快照与隐藏集合不变、通道队列与确认边界保留且新事件接续 seq、满额 503 状态全不变与释放重试、idle 保 idle/running/paused/blocked 转 paused、定位后旧驱动不推进、resume 从新游标重新计时、运行中 503 计时段不变（确定性）、404/422、并发串行、原推进仍禁止倒退、旧接口字段不变
 Dockerfile
 docker-compose.yml   # 挂载 scenes-data 具名卷到 /data（场景与播放存档同在 SCENES_DB_PATH 的 SQLite 中）；CHANNEL_EVENT_LIMIT 配置通道共享容量（默认 1024）
 requirements.txt / requirements-dev.txt
